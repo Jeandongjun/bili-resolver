@@ -119,6 +119,26 @@ describe('/player route (resources=bilibarrage2)', () => {
         expect(body).toEqual({ data: { TopBarrage: [], BottomBarrage: [], RollBarrage: [{ text: 'hello', time: 12 }] } });
     });
 
+    it('accepts Udon-glued request shapes (no proper &id separator)', async () => {
+        installFetchMock({
+            'finger/spi': () => makeResponse({ data: {} }),
+            'GenWebTicket': () => makeResponse({ data: {} }),
+            'player/pagelist': () => makeResponse({ code: 0, data: [{ cid: 7, page: 1, part: 'p', duration: 300 }] }),
+            'seg.so': () => binaryResponse(segReply([danmakuElem({ content: 'glued', progress: 1000, mode: 1 })])),
+        });
+        const shapes = [
+            `${HOST}/player/?resources=bilibarrage2?id=BV1Q541167Qg`,
+            `${HOST}/player/?resources=bilibarrage2BV1Q541167Qg`,
+            `${HOST}/player/?resources=bilibarrage2BV1Q541167Qg?p=2`,
+            `${HOST}/player/?resources=bilibarrage2&id=BV1Q541167Qg&p=2`,
+        ];
+        for (const shape of shapes) {
+            const res = await worker.fetch(new Request(shape), {}, {});
+            const body = await res.json();
+            expect(body.data ? body.data.RollBarrage : body).toEqual([{ text: 'glued', time: 1 }]);
+        }
+    });
+
     it('answers invalid BV ids and unknown resources with player-friendly errors', async () => {
         installFetchMock({});
         const bad = await (await worker.fetch(new Request(`${HOST}/player/?resources=bilibarrage2&id=nope`), {}, {})).json();

@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20261003-004'; // 每次 push 时更新此版本号
+const VERSION = '20261003-006'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -1063,6 +1063,17 @@ function unescapeDanmakuText(text) {
 
 const MAX_DANMAKU_SEGMENTS = 40;
 
+// VRChat VRCStringDownloader / VRCHttpClient 的响应大小上限约 1MB：
+// 超长视频（弹幕上万条）按比例均匀抽样，保留完整时间轴覆盖。
+const MAX_DANMAKU_ITEMS = 10000;
+function capDanmakuList(list, budget) {
+    if (list.length <= budget) return list;
+    const step = list.length / budget;
+    const out = [];
+    for (let i = 0; i < budget; i += 1) out.push(list[Math.floor(i * step)]);
+    return out;
+}
+
 // 二进制（protobuf）API 的多通道抓取：EO 直连 → Vercel 代理 → 官方域名直连。
 // 风控体（HTML 以 '<' 开头 / JSON 错误以 '{' 开头）换下一通道；空体视为合法空分段。
 // 全部被风控时返回最后一个候选（parseDanmakuElems 会安全产出 0 条）。
@@ -1156,6 +1167,15 @@ async function resolveBarrage(bvid, page, debug) {
     RollBarrage.sort(byTime);
     BottomBarrage.sort(byTime);
     TopBarrage.sort(byTime);
+    const total = RollBarrage.length + BottomBarrage.length + TopBarrage.length;
+    if (total > MAX_DANMAKU_ITEMS) {
+        const ratio = MAX_DANMAKU_ITEMS / total;
+        return {
+            TopBarrage: capDanmakuList(TopBarrage, Math.max(1, Math.floor(TopBarrage.length * ratio))),
+            BottomBarrage: capDanmakuList(BottomBarrage, Math.max(1, Math.floor(BottomBarrage.length * ratio))),
+            RollBarrage: capDanmakuList(RollBarrage, Math.max(1, Math.floor(RollBarrage.length * ratio))),
+        };
+    }
     const result = { TopBarrage, BottomBarrage, RollBarrage };
     if (Array.isArray(debug)) result.__trace = debug;
     return result;
@@ -1183,17 +1203,19 @@ export default {
             }
         }
 
-        // VRChat 简-BiliPlayer 弹幕接口：GET /player/?resources=bilibarrage2&id=BVxxx&p=分P
+        // VRChat 简-BiliPlayer 弹幕接口。Udon 侧只用字符串拼接（程序堆里没有 &id= 字面量），
+        // 实际请求可能是 ?resources=bilibarrage2&id=BV、?resources=bilibarrage2?id=BV、
+        // 甚至把 BV 直接粘在 resources 值后面。与原版服务器一致地宽容解析：
+        // 整条查询串包含 bilibarrage2 即视为弹幕请求，BV 号和分 P 从整条查询串中提取。
         if (path === '/player' || path === '/player/') {
             const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
-            const resources = url.searchParams.get('resources');
-            const id = url.searchParams.get('id') || '';
-            if (resources !== 'bilibarrage2') {
+            const rawQuery = url.search.startsWith('?') ? url.search.slice(1) : (url.search || '');
+            if (!rawQuery.toLowerCase().includes('bilibarrage2')) {
                 return new Response(JSON.stringify({ status: 'error', message: '不支持的 resources 类型' }), { status: 200, headers: jsonHeaders });
             }
-            const bv = (id.match(/(BV[a-zA-Z0-9]{10})/) || [])[1];
+            const bv = (rawQuery.match(/(BV[a-zA-Z0-9]{10})/) || [])[1];
             if (!bv) return new Response(JSON.stringify({ status: 'error', message: '无效的 BV 号' }), { status: 200, headers: jsonHeaders });
-            const p = parseInt(url.searchParams.get('p'), 10) || 1;
+            const p = parseInt((rawQuery.match(/(?:\?|&)p=(\d+)/) || [])[1] || '1', 10) || 1;
             try {
                 const debug = url.searchParams.get('debug') === '1' ? [] : null;
                 const bar = await resolveBarrage(bv, p, debug);
