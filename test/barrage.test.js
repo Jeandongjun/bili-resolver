@@ -119,6 +119,20 @@ describe('/player route (resources=bilibarrage2)', () => {
         expect(body).toEqual({ data: { TopBarrage: [], BottomBarrage: [], RollBarrage: [{ text: 'hello', time: 12 }] } });
     });
 
+    it('redirects /player/?url=<bilibili link> to the playable proxy stream', async () => {
+        installFetchMock({
+            'finger/spi': () => makeResponse({ data: {} }),
+            'GenWebTicket': () => makeResponse({ data: {} }),
+            'web-interface/view': () => makeResponse({ code: 0, data: { cid: 123, title: 'TV video', pic: 'p', owner: { name: 'UP' } } }),
+            'web-interface/nav': () => makeResponse({ data: { wbi_img: { img_url: 'https://i0.hdslb.com/bfs/wbi/a.png', sub_url: 'https://i0.hdslb.com/bfs/wbi/b.png' } } }),
+            'player/playurl': () => makeResponse({ code: 0, data: { quality: 64, durl: [{ url: 'https://upos-sz-mirrorcosov.bilivideo.com/tv.mp4' }] } }),
+        });
+        const res = await worker.fetch(new Request(`${HOST}/player/?url=https://www.bilibili.com/video/BV1Q541167Qg`), {}, {});
+        expect(res.status).toBe(302);
+        expect(res.headers.get('Location')).toContain('bili.test/proxy?url=');
+        expect(res.headers.get('Location')).toContain('tv.mp4');
+    });
+
     it('accepts Udon-glued request shapes (no proper &id separator)', async () => {
         installFetchMock({
             'finger/spi': () => makeResponse({ data: {} }),

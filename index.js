@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20261003-006'; // 每次 push 时更新此版本号
+const VERSION = '20261003-007'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -1047,6 +1047,10 @@ function parseDanmakuElems(buf) {
     return elems;
 }
 
+function safeDecodeURIComponent(value) {
+    try { return decodeURIComponent(value); } catch (e) { return value; }
+}
+
 function unescapeDanmakuText(text) {
     return String(text || '')
         .replace(/&lt;/g, '<')
@@ -1211,6 +1215,22 @@ export default {
             const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
             const rawQuery = url.search.startsWith('?') ? url.search.slice(1) : (url.search || '');
             if (!rawQuery.toLowerCase().includes('bilibarrage2')) {
+                // /player/?url=<B站链接/BV号> —— VRChat 电视直连播放入口：
+                // 播放器无法解析 JSON，返回 302 跳到 /proxy 媒体流（支持 Range）。
+                // 仅在带 url= 参数时触发；其它 resources 类型（musicimage 等）不受影响。
+                const urlMatch = rawQuery.match(/url=([^&]*)/);
+                const urlText = urlMatch ? safeDecodeURIComponent(urlMatch[1]) : '';
+                const bv = urlMatch ? ((rawQuery.match(/(BV[a-zA-Z0-9]{10})/) || (urlText.match(/(BV[a-zA-Z0-9]{10})/) || []))[1]) : null;
+                if (bv) {
+                    const qn = parseInt((rawQuery.match(/qn=(\d+)/) || [])[1] || '116', 10) || 116;
+                    try {
+                        const res = await resolveVideo(bv, qn, host);
+                        return Response.redirect(res.playableUrl, 302);
+                    } catch (e) {
+                        const message = (e instanceof AntiCrawlError || e.name === 'AntiCrawlError') ? ANTI_CRAWL_MSG : e.message;
+                        return new Response(JSON.stringify({ status: 'error', message }), { status: 200, headers: jsonHeaders });
+                    }
+                }
                 return new Response(JSON.stringify({ status: 'error', message: '不支持的 resources 类型' }), { status: 200, headers: jsonHeaders });
             }
             const bv = (rawQuery.match(/(BV[a-zA-Z0-9]{10})/) || [])[1];
