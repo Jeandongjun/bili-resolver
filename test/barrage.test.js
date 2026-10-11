@@ -46,10 +46,10 @@ describe('parseDanmakuElems', () => {
         ]);
         const elems = parseDanmakuElems(buf);
         expect(elems).toEqual([
-            { text: '80年代迪厅必放金曲', time: 95.453, mode: 1 },
-            { text: '底部', time: 120, mode: 4 },
-            { text: '顶部', time: 30, mode: 5 },
-            { text: '特殊', time: 1, mode: 7 },
+            { text: '80年代迪厅必放金曲', time: 95.453, mode: 1, color: 16777215 },
+            { text: '底部', time: 120, mode: 4, color: 16777215 },
+            { text: '顶部', time: 30, mode: 5, color: 16777215 },
+            { text: '特殊', time: 1, mode: 7, color: 16777215 },
         ]);
     });
 });
@@ -66,7 +66,7 @@ describe('resolveBarrage', () => {
                 if (url.includes('segment_index=1')) {
                     return binaryResponse(segReply([
                         danmakuElem({ content: 'later scroll', progress: 400000, mode: 1 }),
-                        danmakuElem({ content: 'top &amp; hi', progress: 30000, mode: 5 }),
+                        danmakuElem({ content: 'top & hi', progress: 30000, mode: 5 }),
                     ]));
                 }
                 return binaryResponse(segReply([
@@ -78,12 +78,18 @@ describe('resolveBarrage', () => {
 
         const bar = await resolveBarrage('BV1Q541167Qg', 1);
         expect(segCalls).toBe(2);
-        expect(bar.RollBarrage).toEqual([
-            { text: 'early scroll', time: 5 },
-            { text: 'later scroll', time: 400 },
+        expect(bar.code).toBe(200);
+        expect(bar.bv).toBe('BV1Q541167Qg');
+        expect(bar.p).toBe('1');
+        expect(typeof bar.cid).toBe('number');
+        expect('title' in bar).toBe(true);
+        expect('owner' in bar).toBe(true);
+        expect(bar.data.RollBarrage).toEqual([
+            { time: '5.00000', text: '<color=#FFFFFF>early scroll</color>' },
+            { time: '400.00000', text: '<color=#FFFFFF>later scroll</color>' },
         ]);
-        expect(bar.BottomBarrage).toEqual([{ text: 'bottom one', time: 360 }]);
-        expect(bar.TopBarrage).toEqual([{ text: 'top & hi', time: 30 }]);
+        expect(bar.data.BottomBarrage).toEqual([{ time: '360.00000', text: '<color=#FFFFFF>bottom one</color>' }]);
+        expect(bar.data.TopBarrage).toEqual([{ time: '30.00000', text: '<color=#FFFFFF>top & hi</color>' }]);
     });
 
     it('caps the segment count for very long videos', async () => {
@@ -116,7 +122,12 @@ describe('/player route (resources=bilibarrage2)', () => {
         expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
         expect(res.headers.get('Cache-Control')).toBe('public, max-age=600');
         const body = await res.json();
-        expect(body).toEqual({ data: { TopBarrage: [], BottomBarrage: [], RollBarrage: [{ text: 'hello', time: 12 }] } });
+        expect(body.code).toBe(200);
+        expect(body.bv).toBe('BV1Q541167Qg');
+        expect(body.p).toBe('1');
+        expect(body.data.TopBarrage).toEqual([]);
+        expect(body.data.BottomBarrage).toEqual([]);
+        expect(body.data.RollBarrage).toEqual([{ time: '12.00000', text: '<color=#FFFFFF>hello</color>' }]);
     });
 
     it('redirects /player/?url=<bilibili link> to the playable proxy stream', async () => {
@@ -149,7 +160,7 @@ describe('/player route (resources=bilibarrage2)', () => {
         for (const shape of shapes) {
             const res = await worker.fetch(new Request(shape), {}, {});
             const body = await res.json();
-            expect(body.data ? body.data.RollBarrage : body).toEqual([{ text: 'glued', time: 1 }]);
+            expect(body.data ? body.data.RollBarrage : body).toEqual([{ time: '1.00000', text: '<color=#FFFFFF>glued</color>' }]);
         }
     });
 
@@ -178,6 +189,7 @@ describe('/player route (resources=bilibarrage2)', () => {
         const res = await worker.fetch(new Request(`${HOST}/player/?resources=bilibarrage2&id=BV1Q541167Qg&p=2`), {}, {});
         const body = await res.json();
         expect(requestedCid).toBe('222');
-        expect(body.data.RollBarrage).toEqual([{ text: 'x', time: 1 }]);
+        expect(body.data.RollBarrage).toEqual([{ time: '1.00000', text: '<color=#FFFFFF>x</color>' }]);
+        expect(body.p).toBe('2');
     });
 });

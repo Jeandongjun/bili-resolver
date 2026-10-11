@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20261003-007'; // 每次 push 时更新此版本号
+const VERSION = '20261003-008'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -1038,6 +1038,7 @@ function parseDanmakuElems(buf) {
                     text: new TextDecoder().decode(fields[7]),
                     time: (fields[2] || 0) / 1000,
                     mode: fields[3] || 1,
+                    color: fields[4] || 16777215,
                 });
             }
         } else {
@@ -1121,21 +1122,30 @@ async function resolveBarrage(bvid, page, debug) {
     const headers = { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie };
 
     let cid = 0, duration = 0;
+    let barrageMeta = { title: '', owner: '' };
     try {
-        const pl = await fetchBiliJson(biliApi(`/x/player/pagelist?bvid=${bvid}`), { headers });
-        if (pl && pl.code === 0 && Array.isArray(pl.data) && pl.data.length) {
-            const item = pl.data[page - 1] || pl.data[0];
-            cid = Number(item && item.cid) || 0;
-            duration = Number(item && item.duration) || 0;
-        }
-    } catch (e) { /* 回落到 view */ }
-    if (!cid) {
         const vData = await fetchBiliJson(biliApi(`/x/web-interface/view?bvid=${bvid}`), { headers });
-        if (vData.code !== 0) throw new Error(ERROR_MAP[vData.code] || vData.message || '未找到弹幕数据');
-        const pages = Array.isArray(vData.data.pages) && vData.data.pages.length ? vData.data.pages : null;
-        const item = pages && pages[page - 1] ? pages[page - 1] : vData.data;
-        cid = Number(item.cid) || 0;
-        duration = Number(item.duration) || 0;
+        if (vData.code === 0) {
+            const vpages = Array.isArray(vData.data.pages) && vData.data.pages.length ? vData.data.pages : null;
+            const item = vpages && vpages[page - 1] ? vpages[page - 1] : vData.data;
+            cid = Number(item.cid) || 0;
+            duration = Number(item.duration) || 0;
+            barrageMeta = {
+                title: String(vData.data.title || ''),
+                owner: vData.data.owner ? String(vData.data.owner.name || '') : '',
+            };
+        }
+    } catch (e) { /* 回落到 pagelist */ }
+    if (!cid) {
+        try {
+            const pl = await fetchBiliJson(biliApi(`/x/player/pagelist?bvid=${bvid}`), { headers });
+            if (pl && pl.code === 0 && Array.isArray(pl.data) && pl.data.length) {
+                const item = pl.data[page - 1] || pl.data[0];
+                cid = Number(item && item.cid) || 0;
+                duration = Number(item && item.duration) || 0;
+                barrageMeta = { title: String(item && item.part || ''), owner: '' };
+            }
+        } catch (e) { /* 两者皆失败则报错 */ }
     }
     if (!cid) throw new Error('未找到弹幕数据');
 
@@ -1158,29 +1168,41 @@ async function resolveBarrage(bvid, page, debug) {
         }
     }
 
+    // 与 bil.ouo.chat 同款响应格式（简-BiliPlayer Udon 逐字段核对的 ground truth）：
+    // time 为 5 位小数字符串，text 包 <color=#RRGGBB> Unity 富文本（颜色来自弹幕 color 字段）。
+    const colorTag = (color, text) => '<color=#' + (Number(color) >>> 0).toString(16).padStart(6, '0').toUpperCase() + '>' + text + '</color>';
     const RollBarrage = [], BottomBarrage = [], TopBarrage = [];
     for (const el of elems) {
-        const item = { text: unescapeDanmakuText(el.text), time: Math.round(el.time * 10) / 10 };
-        if (!item.text) continue;
+        if (!el.text) continue;
+        const item = { time: el.time.toFixed(5), text: colorTag(el.color, el.text) };
         if (el.mode === 4) BottomBarrage.push(item);
         else if (el.mode === 5) TopBarrage.push(item);
         else if ((el.mode >= 1 && el.mode <= 3) || el.mode === 6) RollBarrage.push(item);
         // 7/8/9（特殊/高级弹幕）丢弃
     }
-    const byTime = (a, b) => a.time - b.time;
+    const byTime = (a, b) => Number(a.time) - Number(b.time);
     RollBarrage.sort(byTime);
     BottomBarrage.sort(byTime);
     TopBarrage.sort(byTime);
+    let data = { RollBarrage, BottomBarrage, TopBarrage };
     const total = RollBarrage.length + BottomBarrage.length + TopBarrage.length;
     if (total > MAX_DANMAKU_ITEMS) {
         const ratio = MAX_DANMAKU_ITEMS / total;
-        return {
-            TopBarrage: capDanmakuList(TopBarrage, Math.max(1, Math.floor(TopBarrage.length * ratio))),
-            BottomBarrage: capDanmakuList(BottomBarrage, Math.max(1, Math.floor(BottomBarrage.length * ratio))),
+        data = {
             RollBarrage: capDanmakuList(RollBarrage, Math.max(1, Math.floor(RollBarrage.length * ratio))),
+            BottomBarrage: capDanmakuList(BottomBarrage, Math.max(1, Math.floor(BottomBarrage.length * ratio))),
+            TopBarrage: capDanmakuList(TopBarrage, Math.max(1, Math.floor(TopBarrage.length * ratio))),
         };
     }
-    const result = { TopBarrage, BottomBarrage, RollBarrage };
+    const result = {
+        code: 200,
+        title: barrageMeta.title,
+        owner: barrageMeta.owner,
+        bv: bvid,
+        cid: cid,
+        p: String(page),
+        data: data,
+    };
     if (Array.isArray(debug)) result.__trace = debug;
     return result;
 }
@@ -1239,8 +1261,9 @@ export default {
             try {
                 const debug = url.searchParams.get('debug') === '1' ? [] : null;
                 const bar = await resolveBarrage(bv, p, debug);
-                const { __trace, ...data } = bar;
-                return new Response(JSON.stringify(debug ? { data, trace: __trace } : { data }), { status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...(debug ? {} : { 'Cache-Control': 'public, max-age=600' }) } });
+                const __trace = bar.__trace;
+                delete bar.__trace;
+                return new Response(JSON.stringify(debug ? Object.assign({}, bar, { trace: __trace }) : bar), { status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...(debug ? {} : { 'Cache-Control': 'public, max-age=600' }) } });
             } catch (e) {
                 return new Response(JSON.stringify({ status: 'error', message: e.message }), { status: 200, headers: jsonHeaders });
             }
