@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20260609-028'; // 每次 push 时更新此版本号
+const VERSION = '20261003-001'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -37,6 +37,33 @@ function proxiedFetch(originalUrl, options = {}) {
     return fetch(finalUrl, finalOptions);
 }
 
+// --- B 站 API 双通道 ---
+// 主通道：EO 中转（bapi.yamadaryo.me，Worker 直连）。nav / pagelist / playurl / spi
+// 实测均可直连；view 类端点在 EO 出口上可能被 412 风控。
+// 备用通道：既有 Vercel 代理 → 官方 api.bilibili.com，最后直连官方域名。
+// view 解析另有 pagelist 兜底（见 resolveVideo）。
+function biliApiOrigin() {
+    const value = String(WORKER_ENV.BILIBILI_API_ORIGIN || 'https://bapi.yamadaryo.me').trim().replace(/\/+$/, '');
+    try {
+        const parsed = new URL(value);
+        return parsed.protocol === 'https:' && parsed.hostname ? parsed.origin : 'https://api.bilibili.com';
+    } catch (e) { return 'https://api.bilibili.com'; }
+}
+
+function biliApi(path) { return biliApiOrigin() + path; }
+
+// EO 中转地址 → 官方 api.bilibili.com 地址（非 EO 地址返回 null）。
+function toOfficialApi(url) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.origin !== biliApiOrigin()) return null;
+        parsed.hostname = 'api.bilibili.com';
+        parsed.port = '';
+        parsed.protocol = 'https:';
+        return parsed.toString();
+    } catch (e) { return null; }
+}
+
 const ERROR_MAP = {
     '-400': '请求错误', '-403': '访问权限不足', '-404': '视频不存在',
     '-10403': '仅限港澳台地区', '62002': '视频不可见', '62004': '审核中'
@@ -56,15 +83,58 @@ class AntiCrawlError extends Error {
 }
 
 // --- 安全 JSON 抓取助手 ---
-// 集中完成「状态码检查 → Content-Type / body 嗅探 → JSON 解析 → code:-352 识别」，
+// 集中完成「多通道重试 → 状态码检查 → Content-Type / body 嗅探 → JSON 解析 → code:-352 识别」，
 // 识别到反爬时抛出带哨兵标记的 AntiCrawlError（中文消息），绝不让原始的
 // `Unexpected token` / `is not valid JSON` 解析错误泄漏到上层。
 // 注意：非 -352 的业务码（如 -404）不在此处理，原样返回交由调用点既有 ERROR_MAP 逻辑（保证 Preservation）。
-async function fetchBiliJson(url, options) {
-    const res = await proxiedFetch(url, options);
 
-    // 2) body 只消费一次，统一按文本读取后再解析。
-    const text = await res.text();
+// 单个候选响应是否为风控/拦截（应换下一通道重试而非直接失败）：
+// 非 2xx、HTML 风控页、或 code -352 / -412。
+function isBlockedBiliResponse(res, text) {
+    if (!res.ok) return true;
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json') || text.trim().startsWith('<')) return true;
+    try {
+        const json = JSON.parse(text);
+        return json?.code === -352 || json?.code === -412;
+    } catch (e) { return true; }
+}
+
+// 按通道顺序尝试同一 API 调用，返回第一个「健康」响应；
+// 全部候选被风控时返回最后一个（由 fetchBiliJson 归类为 AntiCrawlError），
+// 全部网络失败则直接抛 AntiCrawlError。
+async function fetchBiliResponse(url, options) {
+    const official = toOfficialApi(url);
+    const candidates = [];
+    if (official) {
+        // 调用方传入 EO 中转地址：主通道直连 EO，备用 Vercel 代理 / 直连官方域名。
+        candidates.push({ url, via: 'direct' });
+        if (WORKER_ENV.VERCEL_PROXY) candidates.push({ url: official, via: 'proxy' });
+        candidates.push({ url: official, via: 'direct' });
+    } else if (WORKER_ENV.VERCEL_PROXY) {
+        candidates.push({ url, via: 'proxy' });
+        candidates.push({ url, via: 'direct' });
+    } else {
+        candidates.push({ url, via: 'direct' });
+    }
+
+    let last = null;
+    for (const candidate of candidates) {
+        let res, text;
+        try {
+            res = candidate.via === 'proxy' ? await proxiedFetch(candidate.url, options) : await fetch(candidate.url, options);
+            text = await res.text();
+        } catch (e) { continue; }
+        const current = { res, text };
+        if (!isBlockedBiliResponse(res, text)) return current;
+        last = current;
+    }
+    if (last) return last;
+    throw new AntiCrawlError();
+}
+
+async function fetchBiliJson(url, options) {
+    const { res, text } = await fetchBiliResponse(url, options);
 
     // 1) 非 2xx 视为反爬 / 异常。优先检查是否是 Vercel 代理本身的报错
     if (!res.ok) {
@@ -73,13 +143,13 @@ async function fetchBiliJson(url, options) {
         throw new AntiCrawlError();
     }
 
-    // 3) Content-Type 非 JSON，或 body 以 '<' 开头（HTML / DOCTYPE 风控页）→ 反爬。
+    // 2) Content-Type 非 JSON，或 body 以 '<' 开头（HTML / DOCTYPE 风控页）→ 反爬。
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json') || text.trim().startsWith('<')) {
         throw new AntiCrawlError();
     }
 
-    // 4) JSON 解析失败（避免原始 SyntaxError 泄漏）→ 反爬。
+    // 3) JSON 解析失败（避免原始 SyntaxError 泄漏）→ 反爬。
     let json;
     try {
         json = JSON.parse(text);
@@ -87,18 +157,17 @@ async function fetchBiliJson(url, options) {
         throw new AntiCrawlError();
     }
 
-    // 5) 风控校验失败码 → 反爬。
+    // 4) 风控校验失败码 → 反爬。
     if (json.code === -352) throw new AntiCrawlError();
 
-    // 6) 其余（含其它业务码）原样返回。
+    // 5) 其余（含其它业务码）原样返回。
     return json;
 }
 
 // --- Buvid ---
 async function getBuvid() {
     try {
-        const res = await proxiedFetch("https://api.bilibili.com/x/frontend/finger/spi", { headers: { "User-Agent": UA } });
-        const json = await res.json();
+        const json = await fetchBiliJson(biliApi('/x/frontend/finger/spi'), { headers: { "User-Agent": UA } });
         return json.data?.b_3 || "FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc";
     } catch (e) { return "FE6D3664-927F-F75B-B7D4-733E5D4B263F69428infoc"; }
 }
@@ -130,8 +199,7 @@ async function getAntiCrawlCookie() {
 
     // 1) finger/spi -> b_3 / b_4
     try {
-        const res = await proxiedFetch("https://api.bilibili.com/x/frontend/finger/spi", { headers: { "User-Agent": UA } });
-        const json = await res.json();
+        const json = await fetchBiliJson(biliApi('/x/frontend/finger/spi'), { headers: { "User-Agent": UA } });
         if (json.data?.b_3) buvid3 = json.data.b_3;
         if (json.data?.b_4) buvid4 = json.data.b_4;
     } catch (e) { /* 保留 fallback buvid3 */ }
@@ -141,9 +209,8 @@ async function getAntiCrawlCookie() {
     try {
         const ts = Math.floor(Date.now() / 1000);
         const hexsign = await hmacSha256Hex('XgwSnGZ1p', 'ts' + ts);
-        const ticketUrl = `https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket?key_id=ec02&hexsign=${hexsign}&context[ts]=${ts}&csrf=`;
-        const res = await proxiedFetch(ticketUrl, { method: 'POST', headers: { "User-Agent": UA } });
-        const json = await res.json();
+        const ticketUrl = biliApi(`/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket?key_id=ec02&hexsign=${hexsign}&context[ts]=${ts}&csrf=`);
+        const json = await fetchBiliJson(ticketUrl, { method: 'POST', headers: { "User-Agent": UA } });
         if (json.data?.ticket) ticket = json.data.ticket;
     } catch (e) { /* 降级为仅 buvid3 / buvid4 */ }
 
@@ -168,7 +235,7 @@ async function md5(text) {
 // 拆出此函数是为了让单次解析内只取一次 nav：getPlayUrlWithFallback 的 fallback 循环
 // 可复用缓存的 mixin_key，而不必每个清晰度都重新请求 nav。
 async function getMixinKeyFromNav(cookie) {
-    const json = await fetchBiliJson("https://api.bilibili.com/x/web-interface/nav", {
+    const json = await fetchBiliJson(biliApi('/x/web-interface/nav'), {
         headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
     });
     const { img_url, sub_url } = json.data.wbi_img;
@@ -240,7 +307,7 @@ async function getPlayUrlWithFallback(bvid, cid, targetQn, cookie, mixinKey) {
     const tryAppLine = async (qn, conf) => {
         const params = { bvid, cid: String(cid), qn: String(qn), fnval: '1', fnver: '0', fourk: '1', platform: conf.platform, ts: String(Math.floor(Date.now() / 1000)) };
         const signed = await appSign(params, conf.appkey, conf.appsec);
-        const pData = await fetchBiliJson(`https://api.bilibili.com/x/player/playurl?${signed}`, {
+        const pData = await fetchBiliJson(biliApi(`/x/player/playurl?${signed}`), {
             headers: { 'User-Agent': conf.ua }
         });
         if (pData.code === 0 && pData.data?.durl?.[0]?.url) {
@@ -251,7 +318,7 @@ async function getPlayUrlWithFallback(bvid, cid, targetQn, cookie, mixinKey) {
 
     const tryWebLine = async (qn) => {
         const signedQuery = await signWbi({ bvid, cid, qn, fnval: 1, try_look: 1, platform: 'html5', high_quality: 1 }, cookie, mixin_key);
-        const pData = await fetchBiliJson(`https://api.bilibili.com/x/player/wbi/playurl?${signedQuery}`, {
+        const pData = await fetchBiliJson(biliApi(`/x/player/wbi/playurl?${signedQuery}`), {
             headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
         });
         if (pData.code === 0 && pData.data?.durl?.[0]?.url) {
@@ -289,15 +356,40 @@ async function getPlayUrlWithFallback(bvid, cid, targetQn, cookie, mixinKey) {
 // 单次解析内只采集一次反爬 Cookie（finger/spi 仅请求一次），并将 Cookie 注入
 // view / nav / playurl 三个请求。view 走 fetchBiliJson（识别反爬抛 AntiCrawlError，
 // 不再对 HTML 风控页调 .json() 泄漏 `Unexpected token`）。
-// 顺序保留：先 view，view 业务码检查通过后再取一次 nav（mixin_key），最后 playurl。
-// 这样 view 的反爬/业务错误会在任何 nav 请求之前短路，且 nav 在单次解析内只取一次。
+// view 主通道被 412 风控时，用 pagelist（轻端点，EO 上实测可用）兜底拿 cid 与分 P 标题，
+// 封面 / 作者降级为空；pagelist 也失败时抛出 view 的原始错误。
+// 顺序保留：先 view（含兜底），通过后再取一次 nav（mixin_key），最后 playurl。
 async function resolveVideo(bvid, qn, host) {
     const cookie = await getAntiCrawlCookie();
 
-    const vData = await fetchBiliJson(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
-        headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
-    });
-    if (vData.code !== 0) throw new Error(ERROR_MAP[vData.code] || vData.message);
+    let vData = null;
+    let viewError = null;
+    try {
+        vData = await fetchBiliJson(biliApi(`/x/web-interface/view?bvid=${bvid}`), {
+            headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
+        });
+    } catch (e) {
+        viewError = e;
+    }
+
+    if (!vData || vData.code !== 0) {
+        try {
+            const pl = await fetchBiliJson(biliApi(`/x/player/pagelist?bvid=${bvid}`), {
+                headers: { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie }
+            });
+            const first = pl && pl.code === 0 && Array.isArray(pl.data) ? pl.data[0] : null;
+            const cid = Number(first && first.cid);
+            if (first && Number.isFinite(cid) && cid > 0) {
+                vData = { code: 0, data: { cid, title: String(first.part || ''), pic: '', owner: null } };
+                viewError = null;
+            }
+        } catch (e) { /* 保留 view 原始错误 */ }
+    }
+
+    if (!vData || vData.code !== 0) {
+        if (viewError) throw viewError;
+        throw new Error(ERROR_MAP[vData && vData.code] || (vData && vData.message) || '视频解析失败');
+    }
 
     const { cid, title, pic, owner } = vData.data;
     // 不在此预取 nav：nav 在数据中心 IP 上可能被风控，预取失败会阻断 APP/TV 取流线路。
@@ -309,7 +401,7 @@ async function resolveVideo(bvid, qn, host) {
     const playableUrl = `${host}/proxy?url=${encodeURIComponent(videoStream.url)}&name=${encodeURIComponent(title)}`;
     const downloadUrl = `${host}/proxy?url=${encodeURIComponent(videoStream.url)}&name=${encodeURIComponent(title)}&dl=1`;
 
-    return { title, pic, bvid, author: owner.name, playableUrl, downloadUrl, quality: videoStream.quality, isLive: false };
+    return { title, pic, bvid, author: owner ? owner.name : '', playableUrl, downloadUrl, quality: videoStream.quality, isLive: false };
 }
 
 // --- 直播解析 (v4.1) ---
