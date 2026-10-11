@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20261003-003'; // 每次 push 时更新此版本号
+const VERSION = '20261003-004'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -89,6 +89,33 @@ function proxyApiFetch(officialUrl, options, config) {
     });
 }
 
+// 通道健康记忆：被风控/失联的「通道×端点」在 5 分钟内降到最后尝试，避免每次解析重复撞墙。
+const transportHealth = new Map();
+const TRANSPORT_PENALTY_MS = 5 * 60 * 1000;
+function safeUrlHost(url) { try { return new URL(url).host; } catch (e) { return ''; } }
+function safeUrlPath(url) { try { return new URL(url).pathname; } catch (e) { return url; } }
+function transportKey(candidate, url) {
+    const id = candidate.via === 'proxy'
+        ? 'proxy:' + (candidate.cfg ? candidate.cfg.base : '')
+        : 'direct:' + safeUrlHost(url);
+    return id + safeUrlPath(url);
+}
+function orderCandidates(candidates) {
+    const ready = [], penalized = [];
+    for (const c of candidates) {
+        const until = transportHealth.get(transportKey(c, c.url)) || 0;
+        (Date.now() < until ? penalized : ready).push(c);
+    }
+    return ready.concat(penalized);
+}
+function markTransport(candidate, url, ok) {
+    const key = transportKey(candidate, url);
+    if (ok) { transportHealth.delete(key); return; }
+    if (transportHealth.size > 200) transportHealth.clear();
+    transportHealth.set(key, Date.now() + TRANSPORT_PENALTY_MS);
+}
+function resetTransportHealth() { transportHealth.clear(); }
+
 const ERROR_MAP = {
     '-400': '请求错误', '-403': '访问权限不足', '-404': '视频不存在',
     '-10403': '仅限港澳台地区', '62002': '视频不可见', '62004': '审核中'
@@ -142,14 +169,15 @@ async function fetchBiliResponse(url, options) {
     }
 
     let last = null;
-    for (const candidate of candidates) {
+    for (const candidate of orderCandidates(candidates)) {
         let res, text;
         try {
             res = candidate.via === 'proxy' ? await proxyApiFetch(candidate.url, options, candidate.cfg) : await fetch(candidate.url, options);
             text = await res.text();
-        } catch (e) { continue; }
+        } catch (e) { markTransport(candidate, candidate.url, false); continue; }
         const current = { res, text };
-        if (!isBlockedBiliResponse(res, text)) return current;
+        if (!isBlockedBiliResponse(res, text)) { markTransport(candidate, candidate.url, true); return current; }
+        markTransport(candidate, candidate.url, false);
         last = current;
     }
     if (last) return last;
@@ -592,7 +620,7 @@ const UI = (host) => `
 
             <!-- 结果 -->
             <div id="result" class="hidden space-y-4 pt-4 border-t border-white/5">
-                <video id="inlineVideo" class="hidden w-full rounded-xl bg-black" controls playsinline></video>
+                <div id="playerBox" class="relative"><video id="inlineVideo" class="hidden w-full rounded-xl bg-black" controls playsinline></video><div id="danmakuLayer" class="absolute inset-0 pointer-events-none overflow-hidden" style="font-weight:700;color:#fff;text-shadow:0 1px 3px #000,0 0 2px #000"></div></div>
                 <div class="flex gap-4 items-start">
                     <img id="resPic" referrerpolicy="no-referrer" class="w-28 h-16 object-cover rounded-lg shadow-md bg-slate-800 shrink-0">
                     <div class="min-w-0 flex-1 space-y-1">
@@ -684,6 +712,66 @@ const UI = (host) => `
         }
         function clearHistory() { localStorage.removeItem('bili_history'); loadHistory(); }
         loadHistory();
+        const initialText = new URLSearchParams(location.search).get('text');
+        if (initialText) { document.getElementById('videoInput').value = initialText; parseVideo(); }
+
+        // --- 弹幕层（resources=bilibarrage2） ---
+        const dmState = { items: [], lastT: -1, lane: 0 };
+        function dmClear() {
+            const layer = document.getElementById('danmakuLayer');
+            if (layer) layer.innerHTML = '';
+            dmState.items = []; dmState.lastT = -1; dmState.lane = 0;
+        }
+        async function dmLoad(bvid) {
+            dmClear();
+            try {
+                const res = await fetch('/player/?resources=bilibarrage2&id=' + encodeURIComponent(bvid));
+                const j = await res.json();
+                const d = j.data || {};
+                const items = [];
+                (d.RollBarrage || []).forEach(x => items.push({ text: x.text, t: x.time, type: 'roll', done: false }));
+                (d.BottomBarrage || []).forEach(x => items.push({ text: x.text, t: x.time, type: 'bottom', done: false }));
+                (d.TopBarrage || []).forEach(x => items.push({ text: x.text, t: x.time, type: 'top', done: false }));
+                items.sort((a, b) => a.t - b.t);
+                dmState.items = items;
+            } catch (e) {}
+        }
+        function dmSpawn(item) {
+            const layer = document.getElementById('danmakuLayer');
+            if (!layer || !item.text) return;
+            const el = document.createElement('div');
+            el.textContent = item.text;
+            el.style.position = 'absolute';
+            el.style.whiteSpace = 'nowrap';
+            if (item.type === 'roll') {
+                const lanes = Math.max(1, Math.floor(layer.clientHeight / 26));
+                el.style.top = ((dmState.lane % lanes) * 26 + 4) + 'px';
+                dmState.lane += 1;
+                el.style.left = '100%';
+                el.style.transition = 'transform 9s linear';
+                layer.appendChild(el);
+                requestAnimationFrame(() => { el.style.transform = 'translateX(-' + (layer.clientWidth + el.offsetWidth + 20) + 'px)'; });
+                setTimeout(() => el.remove(), 9200);
+            } else {
+                el.style.left = '50%';
+                el.style.transform = 'translateX(-50%)';
+                if (item.type === 'top') el.style.top = '6px'; else el.style.bottom = '8px';
+                layer.appendChild(el);
+                setTimeout(() => el.remove(), 4000);
+            }
+        }
+        function dmTick(video) {
+            if (!dmState.items.length || video.paused) return;
+            const t = video.currentTime;
+            if (t < dmState.lastT - 1.5) dmState.items.forEach(i => { i.done = false; });
+            dmState.lastT = t;
+            for (const item of dmState.items) {
+                if (item.done || item.t > t) continue;
+                item.done = true;
+                if (t - item.t < 5) dmSpawn(item);
+            }
+        }
+        document.getElementById('inlineVideo').addEventListener('timeupdate', function() { dmTick(this); });
 
         function copyLink() {
             const link = document.getElementById('link').value;
@@ -794,6 +882,10 @@ const UI = (host) => `
             }
             
             document.getElementById('result').classList.remove('hidden');
+            if (!data.isLive) {
+                const bvMatch = (document.getElementById('videoInput').value.match(/BV[a-zA-Z0-9]{10}/i) || [])[0];
+                if (bvMatch) dmLoad(bvMatch); else dmClear();
+            } else dmClear();
         }
     </script>
 </body>
@@ -987,19 +1079,22 @@ async function fetchBiliBinary(url, options) {
     }
     let last = null;
     const tried = [];
-    for (const candidate of candidates) {
+    for (const candidate of orderCandidates(candidates)) {
         let res;
         try {
             res = candidate.via === 'proxy' ? await proxyApiFetch(candidate.url, options, candidate.cfg) : await fetch(candidate.url, options);
         } catch (e) {
+            markTransport(candidate, candidate.url, false);
             tried.push({ via: candidate.via, cfg: candidate.cfg ? candidate.cfg.base.slice(8, 40) : null, fatal: String(e.message || e).slice(0, 60) });
             continue;
         }
         const buf = new Uint8Array(await res.arrayBuffer());
         const head = buf.length ? buf[0] : -1;
         tried.push({ via: candidate.via, cfg: candidate.cfg ? candidate.cfg.base.slice(8, 40) : null, status: res.status, bytes: buf.length, head });
-        if (!res.ok || head === 0x3c || head === 0x7b) { last = { res, buf, tried }; continue; }
-        return { res, buf, tried };
+        const healthy = res.ok && head !== 0x3c && head !== 0x7b;
+        markTransport(candidate, candidate.url, healthy);
+        if (healthy) return { res, buf, tried };
+        last = { res, buf, tried };
     }
     if (last) return last;
     throw new AntiCrawlError();
@@ -1154,7 +1249,8 @@ export default {
                 }
 
                 if (finalBvid) {
-                    const qn = parseInt(url.searchParams.get('qn')) || 116;
+                    // 浏览器直开：跳转到带弹幕的播放页，而不是裸流
+                    return Response.redirect(host + '/?text=' + encodeURIComponent(finalBvid), 302);
                     try {
                         const res = await resolveVideo(finalBvid, qn, host);
                         return Response.redirect(res.downloadUrl, 302);
@@ -1243,4 +1339,4 @@ export default {
 // --- Named exports for testing (non-behavioral) ---
 // Existing functions are exported as-is so tests can drive them directly with a
 // mocked fetch. The `export default` Worker handler above is unchanged.
-export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson, resolveBarrage, parseDanmakuElems };
+export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson, resolveBarrage, parseDanmakuElems, resetTransportHealth };

@@ -5,9 +5,11 @@
  * resolveVideo 必须通过 pagelist 拿到 cid / 标题并继续完成取流，而不是整体报风控。
  */
 
-import { describe, it, expect } from 'vitest';
-import { resolveVideo, AntiCrawlError } from '../index.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { resolveVideo, AntiCrawlError , resetTransportHealth } from '../index.js';
 import { installFetchMock, makeResponse, htmlAntiCrawlResponse } from './setup.js';
+
+afterEach(() => resetTransportHealth());
 
 const BVID = 'BV1Q541167Qg';
 

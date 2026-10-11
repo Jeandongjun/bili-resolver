@@ -3,9 +3,11 @@
  * （protobuf 解码、mode 映射、分页 cid、/player 路由）
  */
 
-import { describe, it, expect } from 'vitest';
-import worker, { parseDanmakuElems, resolveBarrage } from '../index.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import worker, { parseDanmakuElems, resolveBarrage , resetTransportHealth } from '../index.js';
 import { installFetchMock, makeResponse } from './setup.js';
+
+afterEach(() => resetTransportHealth());
 
 // --- 极简 protobuf 编码（测试专用） ---
 function varint(n) {
