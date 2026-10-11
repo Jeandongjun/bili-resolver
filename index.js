@@ -6,7 +6,7 @@
  * - 直播：v4.1 稳定版本 (CN/OV 节点检测)
  */
 
-const VERSION = '20261003-001'; // 每次 push 时更新此版本号
+const VERSION = '20261003-003'; // 每次 push 时更新此版本号
 
 const REFERER = 'https://www.bilibili.com/';
 const LIVE_REFERER = 'https://live.bilibili.com/';
@@ -39,9 +39,14 @@ function proxiedFetch(originalUrl, options = {}) {
 
 // --- B 站 API 双通道 ---
 // 主通道：EO 中转（bapi.yamadaryo.me，Worker 直连）。nav / pagelist / playurl / spi
-// 实测均可直连；view 类端点在 EO 出口上可能被 412 风控。
-// 备用通道：既有 Vercel 代理 → 官方 api.bilibili.com，最后直连官方域名。
+// 实测均可直连；view 类与 dm（seg.so）端点在 EO 出口上可能被 412 风控。
+// 备用通道：Vercel 代理（用户配置的 VERCEL_PROXY，可能已失效）→
+//           bili-proxy-blue 兜底（本仓库架构的固定部署，token 与之配套）→
+//           直连官方域名。
 // view 解析另有 pagelist 兜底（见 resolveVideo）。
+const FALLBACK_API_PROXY = 'https://bili-proxy-blue.vercel.app/api/proxy?url=';
+const FALLBACK_API_PROXY_TOKEN = 'bili_token_vercel';
+
 function biliApiOrigin() {
     const value = String(WORKER_ENV.BILIBILI_API_ORIGIN || 'https://bapi.yamadaryo.me').trim().replace(/\/+$/, '');
     try {
@@ -62,6 +67,26 @@ function toOfficialApi(url) {
         parsed.protocol = 'https:';
         return parsed.toString();
     } catch (e) { return null; }
+}
+
+// 可用的 API 代理配置列表：用户配置优先，blue 部署兜底。
+function apiProxyConfigs() {
+    const configs = [];
+    if (WORKER_ENV.VERCEL_PROXY) configs.push({ base: WORKER_ENV.VERCEL_PROXY, token: WORKER_ENV.PROXY_TOKEN });
+    configs.push({ base: FALLBACK_API_PROXY, token: FALLBACK_API_PROXY_TOKEN });
+    return configs;
+}
+
+// 经由指定 Vercel 代理配置转发官方 API 请求（转发 UA / Referer / Cookie / method / body）。
+function proxyApiFetch(officialUrl, options, config) {
+    const headers = new Headers(options.headers || {});
+    if (config.token) headers.set('x-proxy-token', config.token);
+    const method = String(options.method || 'GET').toUpperCase();
+    return fetch(config.base + encodeURIComponent(officialUrl), {
+        method,
+        headers,
+        ...(method !== 'GET' && method !== 'HEAD' && options.body !== undefined ? { body: options.body } : {}),
+    });
 }
 
 const ERROR_MAP = {
@@ -107,14 +132,12 @@ async function fetchBiliResponse(url, options) {
     const official = toOfficialApi(url);
     const candidates = [];
     if (official) {
-        // 调用方传入 EO 中转地址：主通道直连 EO，备用 Vercel 代理 / 直连官方域名。
+        // 调用方传入 EO 中转地址：主通道直连 EO，备用各 Vercel 代理 / 直连官方域名。
         candidates.push({ url, via: 'direct' });
-        if (WORKER_ENV.VERCEL_PROXY) candidates.push({ url: official, via: 'proxy' });
+        for (const cfg of apiProxyConfigs()) candidates.push({ url: official, via: 'proxy', cfg });
         candidates.push({ url: official, via: 'direct' });
-    } else if (WORKER_ENV.VERCEL_PROXY) {
-        candidates.push({ url, via: 'proxy' });
-        candidates.push({ url, via: 'direct' });
     } else {
+        for (const cfg of apiProxyConfigs()) candidates.push({ url, via: 'proxy', cfg });
         candidates.push({ url, via: 'direct' });
     }
 
@@ -122,7 +145,7 @@ async function fetchBiliResponse(url, options) {
     for (const candidate of candidates) {
         let res, text;
         try {
-            res = candidate.via === 'proxy' ? await proxiedFetch(candidate.url, options) : await fetch(candidate.url, options);
+            res = candidate.via === 'proxy' ? await proxyApiFetch(candidate.url, options, candidate.cfg) : await fetch(candidate.url, options);
             text = await res.text();
         } catch (e) { continue; }
         const current = { res, text };
@@ -866,6 +889,183 @@ async function handleProxy(request, url, host) {
     }
 }
 
+// --- 弹幕（VRChat 简-BiliPlayer resources=bilibarrage2 契约） ---
+// 请求：GET /player/?resources=bilibarrage2&id=BVxxx&p=分P（可省）
+// 返回：{ data: { TopBarrage: [{text,time}], BottomBarrage: [...], RollBarrage: [...] } }
+// time 为秒（float，保留 1 位小数），用于对齐视频 currentTime。
+
+// 极简 protobuf 解码：DmSegMobileReply.elems -> DanmakuElem。
+// 真实字段（对真实 seg.so 逆向实测）：2=progress 毫秒(int32)，3=mode(int32)，7=content(string)；
+// 1=id(int64，丢弃)、4=size、5=color、6=content hash(string)。注意不要用旧 XML 时代的字段表。
+function parseDanmakuElems(buf) {
+    const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    const elems = [];
+    let p = 0;
+    const rv = () => {
+        // Number 累加：弹幕 progress（int32）精确；id（int64）超 2^53 会有精度损失但只用于跳过。
+        let v = 0, s = 0, b;
+        do { b = u8[p++]; v += (b & 0x7f) * Math.pow(2, s); s += 7; } while (b & 0x80);
+        return v;
+    };
+    const skip = (wt) => {
+        if (wt === 0) rv();
+        else if (wt === 1) p += 8;
+        else if (wt === 2) p += rv();
+        else if (wt === 5) p += 4;
+        else throw new Error('unsupported wire type: ' + wt);
+    };
+    // 真实响应在 elems 之后还有其它顶层字段（彩色弹幕配置等 JSON 块），
+    // 对未知结构保持「尽力而为」：任何失步都停止外层循环，保留已解析的弹幕。
+    while (p < u8.length) {
+        let tag;
+        try { tag = rv(); } catch (e) { break; }
+        const fn = tag >>> 3, wt = tag & 7;
+        if (fn === 1 && wt === 2) {
+            // 注意求值顺序：先取长度（rv 会前移 p），再用移动后的 p 计算边界。
+            const len = rv();
+            const end = p + len;
+            if (end > u8.length) break;
+            const fields = {};
+            let broken = false;
+            while (p < end) {
+                try {
+                    const t2 = rv(), fn2 = t2 >>> 3, wt2 = t2 & 7;
+                    if (wt2 === 0) fields[fn2] = rv();
+                    else if (wt2 === 2) {
+                        const l = rv();
+                        if (p + l > u8.length) { broken = true; break; }
+                        fields[fn2] = u8.subarray(p, p + l);
+                        p += l;
+                    }
+                    else skip(wt2);
+                } catch (e) { broken = true; break; }
+            }
+            p = end; // 无论内层是否失步，都按声明长度重新对齐
+            if (!broken && fields[7] && fields[7].length) {
+                elems.push({
+                    text: new TextDecoder().decode(fields[7]),
+                    time: (fields[2] || 0) / 1000,
+                    mode: fields[3] || 1,
+                });
+            }
+        } else {
+            try { skip(wt); } catch (e) { break; }
+        }
+    }
+    return elems;
+}
+
+function unescapeDanmakuText(text) {
+    return String(text || '')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&#x27;/gi, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+        .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+        .replace(/&amp;/g, '&');
+}
+
+const MAX_DANMAKU_SEGMENTS = 40;
+
+// 二进制（protobuf）API 的多通道抓取：EO 直连 → Vercel 代理 → 官方域名直连。
+// 风控体（HTML 以 '<' 开头 / JSON 错误以 '{' 开头）换下一通道；空体视为合法空分段。
+// 全部被风控时返回最后一个候选（parseDanmakuElems 会安全产出 0 条）。
+async function fetchBiliBinary(url, options) {
+    const official = toOfficialApi(url);
+    const candidates = [];
+    if (official) {
+        candidates.push({ url, via: 'direct' });
+        for (const cfg of apiProxyConfigs()) candidates.push({ url: official, via: 'proxy', cfg });
+        candidates.push({ url: official, via: 'direct' });
+    } else {
+        for (const cfg of apiProxyConfigs()) candidates.push({ url, via: 'proxy', cfg });
+        candidates.push({ url, via: 'direct' });
+    }
+    let last = null;
+    const tried = [];
+    for (const candidate of candidates) {
+        let res;
+        try {
+            res = candidate.via === 'proxy' ? await proxyApiFetch(candidate.url, options, candidate.cfg) : await fetch(candidate.url, options);
+        } catch (e) {
+            tried.push({ via: candidate.via, cfg: candidate.cfg ? candidate.cfg.base.slice(8, 40) : null, fatal: String(e.message || e).slice(0, 60) });
+            continue;
+        }
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const head = buf.length ? buf[0] : -1;
+        tried.push({ via: candidate.via, cfg: candidate.cfg ? candidate.cfg.base.slice(8, 40) : null, status: res.status, bytes: buf.length, head });
+        if (!res.ok || head === 0x3c || head === 0x7b) { last = { res, buf, tried }; continue; }
+        return { res, buf, tried };
+    }
+    if (last) return last;
+    throw new AntiCrawlError();
+}
+
+// cid + duration 来自 pagelist（轻端点，EO 上最稳）；seg.so 按 6 分钟分段并行拉取。
+async function resolveBarrage(bvid, page, debug) {
+    const cookie = await getAntiCrawlCookie();
+    const headers = { 'User-Agent': UA, 'Referer': REFERER, 'Cookie': cookie };
+
+    let cid = 0, duration = 0;
+    try {
+        const pl = await fetchBiliJson(biliApi(`/x/player/pagelist?bvid=${bvid}`), { headers });
+        if (pl && pl.code === 0 && Array.isArray(pl.data) && pl.data.length) {
+            const item = pl.data[page - 1] || pl.data[0];
+            cid = Number(item && item.cid) || 0;
+            duration = Number(item && item.duration) || 0;
+        }
+    } catch (e) { /* 回落到 view */ }
+    if (!cid) {
+        const vData = await fetchBiliJson(biliApi(`/x/web-interface/view?bvid=${bvid}`), { headers });
+        if (vData.code !== 0) throw new Error(ERROR_MAP[vData.code] || vData.message || '未找到弹幕数据');
+        const pages = Array.isArray(vData.data.pages) && vData.data.pages.length ? vData.data.pages : null;
+        const item = pages && pages[page - 1] ? pages[page - 1] : vData.data;
+        cid = Number(item.cid) || 0;
+        duration = Number(item.duration) || 0;
+    }
+    if (!cid) throw new Error('未找到弹幕数据');
+
+    const segments = Math.min(Math.max(1, Math.ceil(duration / 360) || 1), MAX_DANMAKU_SEGMENTS);
+    const elems = [];
+    const batchSize = 8;
+    for (let start = 1; start <= segments; start += batchSize) {
+        const indexes = [];
+        for (let i = start; i < start + batchSize && i <= segments; i += 1) indexes.push(i);
+        const buffers = await Promise.all(indexes.map(async (i) => {
+            try {
+                const out = await fetchBiliBinary(biliApi(`/x/v2/dm/web/seg.so?type=1&oid=${cid}&pid=0&segment_index=${i}`), { headers });
+                if (debug && i === 1) debug.push({ segment: i, tried: out.tried });
+                return out.buf.length ? out.buf : null;
+            } catch (e) { return null; }
+        }));
+        for (const buf of buffers) {
+            if (!buf) continue;
+            try { elems.push(...parseDanmakuElems(buf)); } catch (e) { /* 跳过坏段 */ }
+        }
+    }
+
+    const RollBarrage = [], BottomBarrage = [], TopBarrage = [];
+    for (const el of elems) {
+        const item = { text: unescapeDanmakuText(el.text), time: Math.round(el.time * 10) / 10 };
+        if (!item.text) continue;
+        if (el.mode === 4) BottomBarrage.push(item);
+        else if (el.mode === 5) TopBarrage.push(item);
+        else if ((el.mode >= 1 && el.mode <= 3) || el.mode === 6) RollBarrage.push(item);
+        // 7/8/9（特殊/高级弹幕）丢弃
+    }
+    const byTime = (a, b) => a.time - b.time;
+    RollBarrage.sort(byTime);
+    BottomBarrage.sort(byTime);
+    TopBarrage.sort(byTime);
+    const result = { TopBarrage, BottomBarrage, RollBarrage };
+    if (Array.isArray(debug)) result.__trace = debug;
+    return result;
+}
+
 export default {
     async fetch(request, env, ctx) {
         WORKER_ENV = env || {};
@@ -885,6 +1085,27 @@ export default {
                 return Response.redirect(res.downloadUrl, 302);
             } catch (e) {
                 return new Response(`Error: ${e.message}`, { status: 500 });
+            }
+        }
+
+        // VRChat 简-BiliPlayer 弹幕接口：GET /player/?resources=bilibarrage2&id=BVxxx&p=分P
+        if (path === '/player' || path === '/player/') {
+            const jsonHeaders = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+            const resources = url.searchParams.get('resources');
+            const id = url.searchParams.get('id') || '';
+            if (resources !== 'bilibarrage2') {
+                return new Response(JSON.stringify({ status: 'error', message: '不支持的 resources 类型' }), { status: 200, headers: jsonHeaders });
+            }
+            const bv = (id.match(/(BV[a-zA-Z0-9]{10})/) || [])[1];
+            if (!bv) return new Response(JSON.stringify({ status: 'error', message: '无效的 BV 号' }), { status: 200, headers: jsonHeaders });
+            const p = parseInt(url.searchParams.get('p'), 10) || 1;
+            try {
+                const debug = url.searchParams.get('debug') === '1' ? [] : null;
+                const bar = await resolveBarrage(bv, p, debug);
+                const { __trace, ...data } = bar;
+                return new Response(JSON.stringify(debug ? { data, trace: __trace } : { data }), { status: 200, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...(debug ? {} : { 'Cache-Control': 'public, max-age=600' }) } });
+            } catch (e) {
+                return new Response(JSON.stringify({ status: 'error', message: e.message }), { status: 200, headers: jsonHeaders });
             }
         }
 
@@ -1022,4 +1243,4 @@ export default {
 // --- Named exports for testing (non-behavioral) ---
 // Existing functions are exported as-is so tests can drive them directly with a
 // mocked fetch. The `export default` Worker handler above is unchanged.
-export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson };
+export { resolveVideo, getPlayUrlWithFallback, signWbi, getMixinKeyFromNav, appSign, getBuvid, getAntiCrawlCookie, AntiCrawlError, ANTI_CRAWL_MSG, fetchBiliJson, resolveBarrage, parseDanmakuElems };
